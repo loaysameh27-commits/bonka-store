@@ -88,7 +88,7 @@
       Smartphone, Monitor, User
     } from 'lucide-react';
 
-    // Optional Firebase Config Check (Falls back to LocalStorage if no Firebase config is provided)
+    // Optional Firebase Config Check (Falls back to LocalStorage + Real-Time BroadcastChannel if no Firebase config is provided)
     const firebaseConfig = typeof window.__firebase_config !== 'undefined' 
       ? JSON.parse(window.__firebase_config) 
       : {};
@@ -108,6 +108,9 @@
         console.warn("Firebase initialization skipped, using local storage mode.", e);
       }
     }
+
+    // Real-time Cross-Tab / Cross-View Broadcast Channel
+    const syncChannel = typeof BroadcastChannel !== 'undefined' ? new BroadcastChannel('bonka_store_realtime_sync') : null;
 
     const INITIAL_GAMES_SEED = [
       {
@@ -287,10 +290,26 @@
       return `${amount.toLocaleString('ar-EG')} ج.م`;
     };
 
-    const DEFAULT_FB_PROFILE_URL = 'https://www.facebook.com/profile.php?id=61563495661407';
-    const DEFAULT_FB_MESSENGER_URL = 'https://m.me/61563495661407';
+    // Updated Messenger link to https://m.me/358605444011590
+    const DEFAULT_FB_PROFILE_URL = 'https://m.me/358605444011590';
+    const DEFAULT_FB_MESSENGER_URL = 'https://m.me/358605444011590';
     const DEFAULT_ADMIN_PIN = 'BNK#9920$X';
     const SECRET_SEARCH_TRIGGER = '//bnk-root';
+
+    // Helper to upgrade any legacy URLs in storage/database to the new Messenger URL
+    const sanitizeMessengerLink = (url) => {
+      if (
+        !url ||
+        url.includes('61563495661407') ||
+        url === 'https://m.me/psvaultstore'
+      ) {
+        return DEFAULT_FB_MESSENGER_URL;
+      }
+      if (url.startsWith('m.me/')) {
+        return `https://${url}`;
+      }
+      return url;
+    };
 
     const generateVaultCredentials = (gameTitle, licenseType) => {
       const cleanSlug = gameTitle
@@ -324,7 +343,7 @@
       const [accountPool, setAccountPool] = useState([]);
       const [storeConfig, setStoreConfig] = useState({
         whatsappNumber: '201205047037',
-        storePageUrl: DEFAULT_FB_PROFILE_URL,
+        storePageUrl: DEFAULT_FB_MESSENGER_URL,
         messengerUrl: DEFAULT_FB_MESSENGER_URL,
         adminPin: DEFAULT_ADMIN_PIN
       });
@@ -415,10 +434,65 @@
         }, 3600);
       };
 
-      // Helper to persist state in LocalStorage when running without Firebase
+      // Helper to persist state in LocalStorage AND broadcast immediately to all open PC / Mobile windows
       const syncLocalState = (key, data) => {
-        localStorage.setItem(`bonka_local_${key}`, JSON.stringify(data));
+        try {
+          localStorage.setItem(`bonka_local_${key}`, JSON.stringify(data));
+          if (syncChannel) {
+            syncChannel.postMessage({ key, data, timestamp: Date.now() });
+          }
+        } catch (err) {
+          console.error("Local sync error:", err);
+        }
       };
+
+      // Listen for real-time changes from Admin across any open tab/device window
+      useEffect(() => {
+        const applySyncUpdate = (key, data) => {
+          if (!data) return;
+          if (key === 'games') setGames(data);
+          if (key === 'cart') setCart(data);
+          if (key === 'orders') setOrders(data);
+          if (key === 'account_pool') setAccountPool(data);
+          if (key === 'settings') {
+            setStoreConfig((prev) => ({
+              ...prev,
+              ...data,
+              storePageUrl: sanitizeMessengerLink(data.storePageUrl),
+              messengerUrl: sanitizeMessengerLink(data.messengerUrl || data.storePageUrl)
+            }));
+          }
+        };
+
+        const handleStorageEvent = (e) => {
+          if (!e.key || !e.key.startsWith('bonka_local_') || !e.newValue) return;
+          const shortKey = e.key.replace('bonka_local_', '');
+          try {
+            const parsed = JSON.parse(e.newValue);
+            applySyncUpdate(shortKey, parsed);
+          } catch (err) {
+            console.error("Storage parse error:", err);
+          }
+        };
+
+        const handleBroadcastMessage = (e) => {
+          if (e.data && e.data.key) {
+            applySyncUpdate(e.data.key, e.data.data);
+          }
+        };
+
+        window.addEventListener('storage', handleStorageEvent);
+        if (syncChannel) {
+          syncChannel.addEventListener('message', handleBroadcastMessage);
+        }
+
+        return () => {
+          window.removeEventListener('storage', handleStorageEvent);
+          if (syncChannel) {
+            syncChannel.removeEventListener('message', handleBroadcastMessage);
+          }
+        };
+      }, []);
 
       useEffect(() => {
         document.title = lang === 'ar'
@@ -504,7 +578,7 @@
         return () => unsubscribe();
       }, []);
 
-      // Data Synchronization (Firebase Firestore or LocalStorage Fallback)
+      // Data Synchronization (Firebase Firestore + LocalStorage Fallback)
       useEffect(() => {
         if (!authReady || !user) return;
 
@@ -521,7 +595,15 @@
           setOrders(JSON.parse(localStorage.getItem('bonka_local_orders') || '[]'));
           setAccountPool(JSON.parse(localStorage.getItem('bonka_local_account_pool') || '[]'));
           const savedCfg = JSON.parse(localStorage.getItem('bonka_local_settings') || 'null');
-          if (savedCfg) setStoreConfig((prev) => ({ ...prev, ...savedCfg }));
+          if (savedCfg) {
+            const updatedCfg = {
+              ...savedCfg,
+              storePageUrl: sanitizeMessengerLink(savedCfg.storePageUrl),
+              messengerUrl: sanitizeMessengerLink(savedCfg.messengerUrl || savedCfg.storePageUrl)
+            };
+            setStoreConfig((prev) => ({ ...prev, ...updatedCfg }));
+            localStorage.setItem('bonka_local_settings', JSON.stringify(updatedCfg));
+          }
           setLoadingData(false);
           return;
         }
@@ -560,6 +642,7 @@
                 localStorage.setItem('bonka_games_seeded_v1', 'true');
               }
               setGames(loadedGames);
+              syncLocalState('games', loadedGames);
               setLoadingData(false);
             }
           },
@@ -576,6 +659,7 @@
           (snapshot) => {
             const items = snapshot.docs.map((d) => ({ id: d.id, ...d.data() }));
             setCart(items);
+            syncLocalState('cart', items);
           },
           (error) => console.error("Cart listener error:", error)
         );
@@ -589,6 +673,7 @@
               .map((d) => ({ id: d.id, ...d.data() }))
               .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
             setOrders(loadedOrders);
+            syncLocalState('orders', loadedOrders);
           },
           (error) => console.error("Orders listener error:", error)
         );
@@ -602,6 +687,7 @@
               .map((d) => ({ id: d.id, ...d.data() }))
               .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
             setAccountPool(loadedPool);
+            syncLocalState('account_pool', loadedPool);
           },
           (error) => console.error("Account pool listener error:", error)
         );
@@ -613,20 +699,22 @@
           (docSnap) => {
             if (docSnap.exists()) {
               const data = docSnap.data();
-              setStoreConfig((prev) => ({
-                ...prev,
-                ...data,
+              const cleanMessenger = sanitizeMessengerLink(data.storePageUrl);
+              const nextConfig = {
                 whatsappNumber:
                   !data.whatsappNumber || data.whatsappNumber === '201000000000'
                     ? '201205047037'
                     : data.whatsappNumber,
-                storePageUrl:
-                  !data.storePageUrl || data.storePageUrl === 'https://m.me/psvaultstore'
-                    ? DEFAULT_FB_PROFILE_URL
-                    : data.storePageUrl,
-                messengerUrl: data.messengerUrl || DEFAULT_FB_MESSENGER_URL,
+                storePageUrl: cleanMessenger,
+                messengerUrl: sanitizeMessengerLink(data.messengerUrl || cleanMessenger),
                 adminPin: data.adminPin && data.adminPin.trim().length >= 6 ? data.adminPin.trim() : DEFAULT_ADMIN_PIN
+              };
+              setStoreConfig((prev) => ({
+                ...prev,
+                ...data,
+                ...nextConfig
               }));
+              syncLocalState('settings', nextConfig);
             }
           },
           (error) => console.error("Settings listener error:", error)
@@ -640,6 +728,14 @@
           unsubSettings();
         };
       }, [authReady, user]);
+
+      // Keep active modals synchronized when Admin edits a game or order
+      useEffect(() => {
+        if (selectedGameModal) {
+          const updated = games.find((g) => g.id === selectedGameModal.id);
+          if (updated) setSelectedGameModal(updated);
+        }
+      }, [games]);
 
       const formatWhatsAppPhone = (rawPhone) => {
         const digits = (rawPhone || '01205047037').replace(/[^0-9]/g, '');
@@ -703,7 +799,8 @@ Please confirm my order and unlock my PSN account credentials!`;
             : `Hello! I want to confirm my order #${order.orderNumber} for ${order.customerName} (${formatEGP(order.totalAmount, 'en')})`,
           `fb_order_${order.id}`
         );
-        window.open(storeConfig.storePageUrl || DEFAULT_FB_PROFILE_URL, '_blank', 'noopener,noreferrer');
+        const targetMessengerUrl = sanitizeMessengerLink(storeConfig.storePageUrl || DEFAULT_FB_MESSENGER_URL);
+        window.open(targetMessengerUrl, '_blank', 'noopener,noreferrer');
         if (!user || !order?.id) return;
 
         const nextStatus = order.credentialsUnlocked ? order.status : tr('تم الفتح في فيسبوك ماسنجر - بانتظار الإدارة', 'Opened Messenger - Awaiting Admin');
@@ -711,7 +808,7 @@ Please confirm my order and unlock my PSN account credentials!`;
           const updated = orders.map(o => o.id === order.id ? { ...o, confirmationMethod: 'Facebook Messenger', customerClickedConfirm: true, status: nextStatus } : o);
           setOrders(updated);
           syncLocalState('orders', updated);
-          showToast(tr(`تم نسخ تفاصيل الطلب ${order.orderNumber} وفتح صفحة فيسبوك للمراسلة!`, `Order ${order.orderNumber} copied & Facebook Messenger opened!`));
+          showToast(tr(`تم نسخ تفاصيل الطلب ${order.orderNumber} وفتح ماسنجر للمراسلة!`, `Order ${order.orderNumber} copied & Messenger opened!`));
           return;
         }
 
@@ -721,7 +818,7 @@ Please confirm my order and unlock my PSN account credentials!`;
             customerClickedConfirm: true,
             status: nextStatus
           });
-          showToast(tr(`تم نسخ تفاصيل الطلب ${order.orderNumber} وفتح صفحة فيسبوك للمراسلة!`, `Order ${order.orderNumber} copied & Facebook Messenger opened!`));
+          showToast(tr(`تم نسخ تفاصيل الطلب ${order.orderNumber} وفتح ماسنجر للمراسلة!`, `Order ${order.orderNumber} copied & Messenger opened!`));
         } catch (err) {
           console.error("Error updating Messenger confirmation status:", err);
         }
@@ -755,15 +852,16 @@ Please confirm my order and unlock my PSN account credentials!`;
 
       const handleAdminApproveAndUnlockOrder = async (order) => {
         if (!user || !order?.id) return;
+        const updated = orders.map(o => o.id === order.id ? {
+          ...o,
+          credentialsUnlocked: true,
+          status: tr('تم التأكيد وفتح بيانات الحساب', 'Confirmed & Credentials Unlocked'),
+          confirmedAt: Date.now()
+        } : o);
+        setOrders(updated);
+        syncLocalState('orders', updated);
+
         if (!hasValidFirebase) {
-          const updated = orders.map(o => o.id === order.id ? {
-            ...o,
-            credentialsUnlocked: true,
-            status: tr('تم التأكيد وفتح بيانات الحساب', 'Confirmed & Credentials Unlocked'),
-            confirmedAt: Date.now()
-          } : o);
-          setOrders(updated);
-          syncLocalState('orders', updated);
           showToast(tr(`تم تأكيد الطلب ${order.orderNumber} وفتح بيانات الحساب للعميل ${order.customerName}!`, `Order ${order.orderNumber} confirmed and unlocked for ${order.customerName}!`));
           return;
         }
@@ -788,23 +886,26 @@ Please confirm my order and unlock my PSN account credentials!`;
           showToast(tr('يجب أن يتكون الكود السري للإدارة من 6 رموز على الأقل!', 'Secret Admin Code must be at least 6 characters!'), 'error');
           return;
         }
+        const normalizedUrl = sanitizeMessengerLink(storeConfig.storePageUrl.trim());
         const nextCfg = {
           whatsappNumber: storeConfig.whatsappNumber.trim(),
-          storePageUrl: storeConfig.storePageUrl.trim(),
+          storePageUrl: normalizedUrl,
+          messengerUrl: normalizedUrl,
           adminPin: storeConfig.adminPin.trim(),
           updatedAt: Date.now()
         };
 
+        setStoreConfig(prev => ({ ...prev, ...nextCfg }));
+        syncLocalState('settings', nextCfg);
+
         if (!hasValidFirebase) {
-          setStoreConfig(prev => ({ ...prev, ...nextCfg }));
-          syncLocalState('settings', nextCfg);
-          showToast(tr("تم حفظ الإعدادات والكود السري الجديد للإدارة بنجاح!", "Settings & new Admin Secret Code saved!"));
+          showToast(tr("تم حفظ الإعدادات وتطبيقها فوراً على الموبايل والكمبيوتر!", "Settings saved & synced across Mobile and PC!"));
           return;
         }
 
         try {
           await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'store_settings', 'config'), nextCfg);
-          showToast(tr("تم حفظ الإعدادات والكود السري الجديد للإدارة بنجاح!", "Settings & new Admin Secret Code saved!"));
+          showToast(tr("تم حفظ الإعدادات وتطبيقها فوراً على الموبايل والكمبيوتر!", "Settings saved & synced across Mobile and PC!"));
         } catch (err) {
           console.error("Error saving settings:", err);
           showToast(tr("تعذر حفظ الإعدادات.", "Could not save settings."), "error");
@@ -854,30 +955,31 @@ Please confirm my order and unlock my PSN account credentials!`;
         const cartItemId = `${game.id}_${licenseType}`;
         const existingItem = cart.find((item) => item.id === cartItemId);
 
-        if (!hasValidFirebase) {
-          let updatedCart;
-          if (existingItem) {
-            if (existingItem.quantity + 1 > availableStock) {
-              showToast(tr(`الحد الأقصى المتاح هو (${availableStock}) حسابات`, `Maximum available stock is (${availableStock}) accounts`), 'error');
-              return;
-            }
-            updatedCart = cart.map(item => item.id === cartItemId ? { ...item, quantity: item.quantity + 1 } : item);
-          } else {
-            updatedCart = [...cart, {
-              id: cartItemId,
-              gameId: game.id,
-              title: game.title,
-              console: game.console,
-              image: game.image,
-              licenseType,
-              price: unitPrice,
-              retailPrice: normalizeEgpPrice(game.retailPrice, 3200),
-              quantity: 1,
-              addedAt: Date.now()
-            }];
+        let updatedCart;
+        if (existingItem) {
+          if (existingItem.quantity + 1 > availableStock) {
+            showToast(tr(`الحد الأقصى المتاح هو (${availableStock}) حسابات`, `Maximum available stock is (${availableStock}) accounts`), 'error');
+            return;
           }
-          setCart(updatedCart);
-          syncLocalState('cart', updatedCart);
+          updatedCart = cart.map(item => item.id === cartItemId ? { ...item, quantity: item.quantity + 1 } : item);
+        } else {
+          updatedCart = [...cart, {
+            id: cartItemId,
+            gameId: game.id,
+            title: game.title,
+            console: game.console,
+            image: game.image,
+            licenseType,
+            price: unitPrice,
+            retailPrice: normalizeEgpPrice(game.retailPrice, 3200),
+            quantity: 1,
+            addedAt: Date.now()
+          }];
+        }
+        setCart(updatedCart);
+        syncLocalState('cart', updatedCart);
+
+        if (!hasValidFirebase) {
           showToast(
             tr(
               `تمت إضافة ${game.title} (حساب ${licenseType === 'Primary' ? 'أساسي' : 'ثانوي'}) إلى السلة!`,
@@ -890,10 +992,6 @@ Please confirm my order and unlock my PSN account credentials!`;
         try {
           const itemRef = doc(db, 'artifacts', appId, 'users', user.uid, 'cart', cartItemId);
           if (existingItem) {
-            if (existingItem.quantity + 1 > availableStock) {
-              showToast(tr(`الحد الأقصى المتاح هو (${availableStock}) حسابات`, `Maximum available stock is (${availableStock}) accounts`), 'error');
-              return;
-            }
             await updateDoc(itemRef, {
               quantity: existingItem.quantity + 1
             });
@@ -926,14 +1024,13 @@ Please confirm my order and unlock my PSN account credentials!`;
         if (!user) return;
         const newQty = cartItem.quantity + delta;
 
-        if (!hasValidFirebase) {
-          const updated = newQty <= 0
-            ? cart.filter(i => i.id !== cartItem.id)
-            : cart.map(i => i.id === cartItem.id ? { ...i, quantity: newQty } : i);
-          setCart(updated);
-          syncLocalState('cart', updated);
-          return;
-        }
+        const updated = newQty <= 0
+          ? cart.filter(i => i.id !== cartItem.id)
+          : cart.map(i => i.id === cartItem.id ? { ...i, quantity: newQty } : i);
+        setCart(updated);
+        syncLocalState('cart', updated);
+
+        if (!hasValidFirebase) return;
 
         const itemRef = doc(db, 'artifacts', appId, 'users', user.uid, 'cart', cartItem.id);
         try {
@@ -949,10 +1046,11 @@ Please confirm my order and unlock my PSN account credentials!`;
 
       const removeFromCart = async (cartItemId) => {
         if (!user) return;
+        const updated = cart.filter(i => i.id !== cartItemId);
+        setCart(updated);
+        syncLocalState('cart', updated);
+
         if (!hasValidFirebase) {
-          const updated = cart.filter(i => i.id !== cartItemId);
-          setCart(updated);
-          syncLocalState('cart', updated);
           showToast(tr("تم حذف اللعبة من السلة", "Removed game from cart"), "info");
           return;
         }
@@ -967,15 +1065,16 @@ Please confirm my order and unlock my PSN account credentials!`;
 
       const handleDeleteGame = async (gameId, title) => {
         if (!user || !gameId) return;
+        const nextGames = games.filter(g => g.id !== gameId);
+        const nextCart = cart.filter(c => c.gameId !== gameId);
+        setGames(nextGames);
+        setCart(nextCart);
+        syncLocalState('games', nextGames);
+        syncLocalState('cart', nextCart);
+        setGameToDeleteModal(null);
+        if (selectedGameModal?.id === gameId) setSelectedGameModal(null);
+
         if (!hasValidFirebase) {
-          const nextGames = games.filter(g => g.id !== gameId);
-          const nextCart = cart.filter(c => c.gameId !== gameId);
-          setGames(nextGames);
-          setCart(nextCart);
-          syncLocalState('games', nextGames);
-          syncLocalState('cart', nextCart);
-          setGameToDeleteModal(null);
-          if (selectedGameModal?.id === gameId) setSelectedGameModal(null);
           showToast(tr(`تم حذف لعبة "${title}" من المتجر نهائياً.`, `Removed "${title}" from the store.`), 'info');
           return;
         }
@@ -986,10 +1085,6 @@ Please confirm my order and unlock my PSN account credentials!`;
           for (const cItem of matchingCartItems) {
             await deleteDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'cart', cItem.id));
           }
-          setGameToDeleteModal(null);
-          if (selectedGameModal?.id === gameId) {
-            setSelectedGameModal(null);
-          }
           showToast(tr(`تم حذف لعبة "${title}" من المتجر نهائياً.`, `Removed "${title}" from the store.`), 'info');
         } catch (err) {
           console.error("Error deleting game:", err);
@@ -999,9 +1094,10 @@ Please confirm my order and unlock my PSN account credentials!`;
 
       const handleRestoreDefaultGames = async () => {
         if (!user) return;
+        setGames(INITIAL_GAMES_SEED);
+        syncLocalState('games', INITIAL_GAMES_SEED);
+
         if (!hasValidFirebase) {
-          setGames(INITIAL_GAMES_SEED);
-          syncLocalState('games', INITIAL_GAMES_SEED);
           showToast(tr("تمت استعادة الألعاب الافتراضية للمتجر بنجاح!", "Default catalog games restored successfully!"));
           return;
         }
@@ -1039,9 +1135,14 @@ Please confirm my order and unlock my PSN account credentials!`;
         let retailTotal = 0;
         let count = 0;
         cart.forEach((item) => {
+          const liveGame = games.find((g) => g.id === item.gameId);
           const qty = Number(item.quantity) || 1;
-          const price = normalizeEgpPrice(item.price, 750);
-          const retail = normalizeEgpPrice(item.retailPrice, 3200);
+          const price = liveGame
+            ? (item.licenseType === 'Primary' ? normalizeEgpPrice(liveGame.primaryPrice, 1100) : normalizeEgpPrice(liveGame.secondaryPrice, 650))
+            : normalizeEgpPrice(item.price, 750);
+          const retail = liveGame
+            ? normalizeEgpPrice(liveGame.retailPrice, 3200)
+            : normalizeEgpPrice(item.retailPrice, 3200);
           subtotal += price * qty;
           retailTotal += retail * qty;
           count += qty;
@@ -1052,7 +1153,7 @@ Please confirm my order and unlock my PSN account credentials!`;
           totalSavings: Math.max(0, retailTotal - subtotal),
           count
         };
-      }, [cart]);
+      }, [cart, games]);
 
       const handleCompleteCheckout = async (e) => {
         e.preventDefault();
@@ -1073,6 +1174,11 @@ Please confirm my order and unlock my PSN account credentials!`;
 
           for (const item of cart) {
             const qty = Number(item.quantity) || 1;
+            const liveGame = games.find((g) => g.id === item.gameId);
+            const activeUnitPrice = liveGame
+              ? (item.licenseType === 'Primary' ? normalizeEgpPrice(liveGame.primaryPrice, 1100) : normalizeEgpPrice(liveGame.secondaryPrice, 650))
+              : normalizeEgpPrice(item.price, 750);
+
             for (let i = 0; i < qty; i++) {
               const matchingPoolAcc = accountPool.find(
                 (acc) =>
@@ -1086,17 +1192,17 @@ Please confirm my order and unlock my PSN account credentials!`;
                 usedPoolIds.add(matchingPoolAcc.id);
                 deliveredAccounts.push({
                   gameId: item.gameId,
-                  title: item.title,
-                  console: item.console,
-                  image: item.image,
+                  title: liveGame?.title || item.title,
+                  console: liveGame?.console || item.console,
+                  image: liveGame?.image || item.image,
                   licenseType: item.licenseType,
-                  pricePaid: normalizeEgpPrice(item.price, 750),
+                  pricePaid: activeUnitPrice,
                   psnEmail: matchingPoolAcc.psnEmail,
                   psnPassword: matchingPoolAcc.psnPassword,
                   twoStepCode: matchingPoolAcc.twoStepCode,
                   activationInstructions:
                     matchingPoolAcc.notes ||
-                    generateVaultCredentials(item.title, item.licenseType).activationInstructions
+                    generateVaultCredentials(liveGame?.title || item.title, item.licenseType).activationInstructions
                 });
 
                 if (hasValidFirebase) {
@@ -1108,23 +1214,22 @@ Please confirm my order and unlock my PSN account credentials!`;
                   });
                 }
               } else {
-                const generated = generateVaultCredentials(item.title, item.licenseType);
+                const generated = generateVaultCredentials(liveGame?.title || item.title, item.licenseType);
                 deliveredAccounts.push({
                   gameId: item.gameId,
-                  title: item.title,
-                  console: item.console,
-                  image: item.image,
+                  title: liveGame?.title || item.title,
+                  console: liveGame?.console || item.console,
+                  image: liveGame?.image || item.image,
                   licenseType: item.licenseType,
-                  pricePaid: normalizeEgpPrice(item.price, 750),
+                  pricePaid: activeUnitPrice,
                   ...generated
                 });
               }
             }
 
-            const gameObj = games.find((g) => g.id === item.gameId);
-            if (gameObj && hasValidFirebase) {
+            if (liveGame && hasValidFirebase) {
               const stockField = item.licenseType === 'Primary' ? 'primaryStock' : 'secondaryStock';
-              const currentStock = Number(gameObj[stockField]) || 0;
+              const currentStock = Number(liveGame[stockField]) || 0;
               await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'games', item.gameId), {
                 [stockField]: Math.max(0, currentStock - qty)
               });
@@ -1148,37 +1253,37 @@ Please confirm my order and unlock my PSN account credentials!`;
             createdAt: Date.now()
           };
 
+          const localOrder = { id: 'ord_' + Date.now(), ...newOrderData };
+          const nextOrders = [localOrder, ...orders];
+          setOrders(nextOrders);
+          syncLocalState('orders', nextOrders);
+
+          const nextPool = accountPool.map(acc => usedPoolIds.has(acc.id) ? {
+            ...acc,
+            status: 'assigned',
+            assignedOrderNumber: orderNumber,
+            assignedToEmail: checkoutForm.customerEmail,
+            assignedAt: Date.now()
+          } : acc);
+          setAccountPool(nextPool);
+          syncLocalState('account_pool', nextPool);
+
+          const nextGames = games.map(g => {
+            const cartItemPrimary = cart.find(c => c.gameId === g.id && c.licenseType === 'Primary');
+            const cartItemSecondary = cart.find(c => c.gameId === g.id && c.licenseType === 'Secondary');
+            return {
+              ...g,
+              primaryStock: cartItemPrimary ? Math.max(0, Number(g.primaryStock) - cartItemPrimary.quantity) : g.primaryStock,
+              secondaryStock: cartItemSecondary ? Math.max(0, Number(g.secondaryStock) - cartItemSecondary.quantity) : g.secondaryStock
+            };
+          });
+          setGames(nextGames);
+          syncLocalState('games', nextGames);
+
+          setCart([]);
+          syncLocalState('cart', []);
+
           if (!hasValidFirebase) {
-            const localOrder = { id: 'ord_' + Date.now(), ...newOrderData };
-            const nextOrders = [localOrder, ...orders];
-            setOrders(nextOrders);
-            syncLocalState('orders', nextOrders);
-
-            const nextPool = accountPool.map(acc => usedPoolIds.has(acc.id) ? {
-              ...acc,
-              status: 'assigned',
-              assignedOrderNumber: orderNumber,
-              assignedToEmail: checkoutForm.customerEmail,
-              assignedAt: Date.now()
-            } : acc);
-            setAccountPool(nextPool);
-            syncLocalState('account_pool', nextPool);
-
-            const nextGames = games.map(g => {
-              const cartItemPrimary = cart.find(c => c.gameId === g.id && c.licenseType === 'Primary');
-              const cartItemSecondary = cart.find(c => c.gameId === g.id && c.licenseType === 'Secondary');
-              return {
-                ...g,
-                primaryStock: cartItemPrimary ? Math.max(0, Number(g.primaryStock) - cartItemPrimary.quantity) : g.primaryStock,
-                secondaryStock: cartItemSecondary ? Math.max(0, Number(g.secondaryStock) - cartItemSecondary.quantity) : g.secondaryStock
-              };
-            });
-            setGames(nextGames);
-            syncLocalState('games', nextGames);
-
-            setCart([]);
-            syncLocalState('cart', []);
-
             setCheckoutModalOpen(false);
             setCartOpen(false);
             setActiveTab('orders');
@@ -1272,19 +1377,38 @@ Please confirm my order and unlock my PSN account credentials!`;
           updatedAt: Date.now()
         };
 
+        let nextGames;
+        const targetId = editingGameId || `${(payload.title.toLowerCase().replace(/[^a-z0-9]/g, '-') || 'game')}-${Date.now().toString().slice(-4)}`;
+        if (editingGameId) {
+          nextGames = games.map(g => g.id === editingGameId ? { ...g, ...payload } : g);
+        } else {
+          const newGame = { id: targetId, ...payload, createdAt: Date.now() };
+          nextGames = [newGame, ...games];
+        }
+        setGames(nextGames);
+        syncLocalState('games', nextGames);
+
+        // Also sync any matching items in the cart so Mobile/PC cart reflects new prices/titles immediately
+        const updatedCart = cart.map((cItem) => {
+          if (cItem.gameId !== targetId) return cItem;
+          return {
+            ...cItem,
+            title: payload.title,
+            console: payload.console,
+            image: payload.image,
+            price: cItem.licenseType === 'Primary' ? payload.primaryPrice : payload.secondaryPrice,
+            retailPrice: payload.retailPrice
+          };
+        });
+        setCart(updatedCart);
+        syncLocalState('cart', updatedCart);
+
         if (!hasValidFirebase) {
-          let nextGames;
-          if (editingGameId) {
-            nextGames = games.map(g => g.id === editingGameId ? { ...g, ...payload } : g);
-            showToast(tr(`تم تحديث بيانات لعبة "${payload.title}" بنجاح!`, `Updated "${payload.title}" successfully!`));
-          } else {
-            const slugId = payload.title.toLowerCase().replace(/[^a-z0-9]/g, '-') || `game-${Date.now()}`;
-            const newGame = { id: `${slugId}-${Date.now().toString().slice(-4)}`, ...payload, createdAt: Date.now() };
-            nextGames = [newGame, ...games];
-            showToast(tr(`تمت إضافة لعبة "${payload.title}" إلى المتجر!`, `Added "${payload.title}" to the store!`));
-          }
-          setGames(nextGames);
-          syncLocalState('games', nextGames);
+          showToast(
+            editingGameId
+              ? tr(`تم تحديث "${payload.title}" في شاشات الموبايل والكمبيوتر!`, `Updated "${payload.title}" across Mobile & PC!`)
+              : tr(`تمت إضافة "${payload.title}" للمتجر!`, `Added "${payload.title}" to the store!`)
+          );
           resetGameForm();
           setAdminSubTab('inventory');
           return;
@@ -1293,19 +1417,13 @@ Please confirm my order and unlock my PSN account credentials!`;
         try {
           if (editingGameId) {
             await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'games', editingGameId), payload);
-            showToast(tr(`تم تحديث بيانات لعبة "${payload.title}" بنجاح!`, `Updated "${payload.title}" successfully!`));
+            showToast(tr(`تم تحديث "${payload.title}" في شاشات الموبايل والكمبيوتر!`, `Updated "${payload.title}" across Mobile & PC!`));
           } else {
-            const slugId =
-              payload.title
-                .toLowerCase()
-                .replace(/[^a-z0-9]/g, '-')
-                .replace(/-+/g, '-')
-                .replace(/^-|-$/g, '') || `game-${Date.now()}`;
-            await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'games', `${slugId}-${Date.now().toString().slice(-4)}`), {
+            await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'games', targetId), {
               ...payload,
               createdAt: Date.now()
             });
-            showToast(tr(`تمت إضافة لعبة "${payload.title}" إلى المتجر!`, `Added "${payload.title}" to the store!`));
+            showToast(tr(`تمت إضافة "${payload.title}" إلى المتجر!`, `Added "${payload.title}" to the store!`));
           }
           resetGameForm();
           setAdminSubTab('inventory');
@@ -1334,16 +1452,16 @@ Please confirm my order and unlock my PSN account credentials!`;
           createdAt: Date.now()
         };
 
+        const nextPool = [{ id: 'vault_' + Date.now(), ...newAcc }, ...accountPool];
+        setAccountPool(nextPool);
+        syncLocalState('account_pool', nextPool);
+
+        const stockField = vaultForm.licenseType === 'Primary' ? 'primaryStock' : 'secondaryStock';
+        const nextGames = games.map(g => g.id === targetGame.id ? { ...g, [stockField]: (Number(g[stockField]) || 0) + 1 } : g);
+        setGames(nextGames);
+        syncLocalState('games', nextGames);
+
         if (!hasValidFirebase) {
-          const nextPool = [{ id: 'vault_' + Date.now(), ...newAcc }, ...accountPool];
-          setAccountPool(nextPool);
-          syncLocalState('account_pool', nextPool);
-
-          const stockField = vaultForm.licenseType === 'Primary' ? 'primaryStock' : 'secondaryStock';
-          const nextGames = games.map(g => g.id === targetGame.id ? { ...g, [stockField]: (Number(g[stockField]) || 0) + 1 } : g);
-          setGames(nextGames);
-          syncLocalState('games', nextGames);
-
           setVaultForm((prev) => ({ ...prev, psnEmail: '', psnPassword: '', twoStepCode: '', notes: '' }));
           showToast(tr(`تم حفظ الحساب في الخزنة وزيادة مخزون ${targetGame.title} (+1)!`, `Saved account to Vault & incremented ${targetGame.title} stock (+1)!`));
           return;
@@ -1351,8 +1469,6 @@ Please confirm my order and unlock my PSN account credentials!`;
 
         try {
           await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'account_pool'), newAcc);
-
-          const stockField = vaultForm.licenseType === 'Primary' ? 'primaryStock' : 'secondaryStock';
           const currentStock = Number(targetGame[stockField]) || 0;
           await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'games', targetGame.id), {
             [stockField]: currentStock + 1
@@ -1374,10 +1490,11 @@ Please confirm my order and unlock my PSN account credentials!`;
 
       const handleDeleteVaultAccount = async (acc) => {
         if (!user || !acc?.id) return;
+        const nextPool = accountPool.filter(a => a.id !== acc.id);
+        setAccountPool(nextPool);
+        syncLocalState('account_pool', nextPool);
+
         if (!hasValidFirebase) {
-          const nextPool = accountPool.filter(a => a.id !== acc.id);
-          setAccountPool(nextPool);
-          syncLocalState('account_pool', nextPool);
           showToast(tr("تم حذف الحساب من الخزنة.", "Removed account from vault."), "info");
           return;
         }
@@ -1413,16 +1530,17 @@ Please confirm my order and unlock my PSN account credentials!`;
         e.preventDefault();
         if (!user || !managingOrderModal) return;
 
+        const nextOrders = orders.map(o => o.id === managingOrderModal.id ? {
+          ...o,
+          deliveredAccounts: JSON.stringify(editableOrderAccounts),
+          credentialsUnlocked: true,
+          status: tr('تم التأكيد وإرسال بيانات الحساب', 'Confirmed & Credentials Sent'),
+          confirmedAt: Date.now()
+        } : o);
+        setOrders(nextOrders);
+        syncLocalState('orders', nextOrders);
+
         if (!hasValidFirebase) {
-          const nextOrders = orders.map(o => o.id === managingOrderModal.id ? {
-            ...o,
-            deliveredAccounts: JSON.stringify(editableOrderAccounts),
-            credentialsUnlocked: true,
-            status: tr('تم التأكيد وإرسال بيانات الحساب', 'Confirmed & Credentials Sent'),
-            confirmedAt: Date.now()
-          } : o);
-          setOrders(nextOrders);
-          syncLocalState('orders', nextOrders);
           setManagingOrderModal(null);
           showToast(tr(`تم تحديث وإرسال بيانات الحساب للطلب ${managingOrderModal.orderNumber}!`, `Updated and unlocked credentials for order ${managingOrderModal.orderNumber}!`));
           return;
@@ -1484,6 +1602,8 @@ Please confirm my order and unlock my PSN account credentials!`;
         return orders.filter((o) => o.userId === user.uid);
       }, [orders, user]);
 
+      const activeMessengerHref = sanitizeMessengerLink(storeConfig.storePageUrl || DEFAULT_FB_MESSENGER_URL);
+
       return (
         <div
           dir={isAr ? 'rtl' : 'ltr'}
@@ -1518,7 +1638,7 @@ Please confirm my order and unlock my PSN account credentials!`;
                 <div className="flex items-center gap-2">
                   <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-blue-500/15 border border-blue-500/30 text-blue-300 text-[11px] font-bold">
                     <Eye className="w-3.5 h-3.5 text-blue-400" />
-                    <span>{tr('وضع الإدارة مفعل (مخفي عن العملاء):', 'Admin Mode Active (Hidden from Customers):')}</span>
+                    <span>{tr('وضع الإدارة مفعل (تزامن مباشر للموبايل والكمبيوتر):', 'Admin Mode Active (Live Mobile & PC Sync):')}</span>
                   </span>
 
                   <button
@@ -1581,8 +1701,8 @@ Please confirm my order and unlock my PSN account credentials!`;
                 <Smartphone className="w-4 h-4 text-blue-400" />
                 <span>
                   {tr(
-                    'معاينة شاشة موبايل العميل (390px × 820px) — يمكنك التصفح والشراء بداخلها مباشرة',
-                    'Interactive Customer Mobile Phone Preview (390px × 820px)'
+                    'معاينة شاشة موبايل العميل (390px × 820px) — كل تعديلات الإدارة تطبق هنا فوراً',
+                    'Interactive Customer Mobile Phone Preview (390px × 820px) — Live Admin Sync'
                   )}
                 </span>
               </div>
@@ -1732,11 +1852,11 @@ Please confirm my order and unlock my PSN account credentials!`;
                     </button>
 
                     <a
-                      href={storeConfig.storePageUrl || DEFAULT_FB_PROFILE_URL}
+                      href={activeMessengerHref}
                       target="_blank"
                       rel="noopener noreferrer"
                       className="hidden xl:flex items-center gap-1.5 px-3 py-2.5 rounded-2xl bg-blue-600/20 hover:bg-blue-600/30 border border-blue-500/40 text-blue-300 text-xs font-bold transition-all"
-                      title={tr('صفحتنا على فيسبوك وماسنجر', 'Our Facebook Page & Messenger')}
+                      title={tr('تواصل معنا عبر ماسنجر', 'Chat on Messenger')}
                     >
                       <MessageCircle className="w-3.5 h-3.5" />
                       <span>{tr('ماسنجر', 'Messenger')}</span>
@@ -1747,7 +1867,7 @@ Please confirm my order and unlock my PSN account credentials!`;
                       target="_blank"
                       rel="noopener noreferrer"
                       className="hidden lg:flex items-center gap-1.5 px-3 py-2.5 rounded-2xl bg-emerald-600/20 hover:bg-emerald-600/30 border border-emerald-500/40 text-emerald-300 text-xs font-bold transition-all"
-                      title="WhatsApp: 01205047037"
+                      title={`WhatsApp: ${storeConfig.whatsappNumber}`}
                     >
                       <PhoneCall className="w-3.5 h-3.5" />
                       <span dir="ltr">01205047037</span>
@@ -2437,7 +2557,7 @@ Please confirm my order and unlock my PSN account credentials!`;
                                     </div>
                                     <p className="text-xs text-slate-300">
                                       {tr(
-                                        'تم حجز حسابك بنجاح! اضغط بالأسفل لإرسال فاتورة طلبك إلى الإدارة عبر واتساب أو صفحة فيسبوك ماسنجر ليتم فتح بيانات الحساب لك فوراً.',
+                                        'تم حجز حسابك بنجاح! اضغط بالأسفل لإرسال فاتورة طلبك إلى الإدارة عبر واتساب أو فيسبوك ماسنجر ليتم فتح بيانات الحساب لك فوراً.',
                                         'Your account slot is reserved! Click below to send your order receipt via WhatsApp or Facebook Messenger so the Admin unlocks your PSN credentials.'
                                       )}
                                     </p>
@@ -2569,7 +2689,7 @@ Please confirm my order and unlock my PSN account credentials!`;
                                               </p>
                                               <p className="text-[11px] text-slate-400">
                                                 {tr(
-                                                  'أرسل طلبك عبر واتساب (01205047037) أو ماسنجر صفحة فيسبوك. بمجرد تأكيد الإدارة، سيظهر الإيميل والرقم السري هنا تلقائياً.',
+                                                  'أرسل طلبك عبر واتساب (01205047037) أو ماسنجر فيسبوك. بمجرد تأكيد الإدارة، سيظهر الإيميل والرقم السري هنا تلقائياً.',
                                                   'Confirm via WhatsApp (01205047037) or Facebook Messenger. Once approved by Admin, your login credentials appear here.'
                                                 )}
                                               </p>
@@ -2700,11 +2820,11 @@ Please confirm my order and unlock my PSN account credentials!`;
                       </div>
 
                       <div className="p-5 rounded-2xl bg-slate-900/90 border border-white/10">
-                        <span className="text-xs text-slate-400">{tr('رقم واتساب الإدارة المفعل', 'Active Admin WhatsApp')}</span>
-                        <p dir="ltr" className="text-lg font-mono font-black text-emerald-400 mt-1 truncate">
-                          01205047037 (+{formatWhatsAppPhone(storeConfig.whatsappNumber)})
+                        <span className="text-xs text-slate-400">{tr('رابط ماسنجر المفعل', 'Active Messenger Link')}</span>
+                        <p dir="ltr" className="text-xs font-mono font-black text-blue-400 mt-1 truncate">
+                          {activeMessengerHref}
                         </p>
-                        <span className="text-[11px] text-slate-500">{tr('يستقبل فواتير العملاء مباشرة', 'Receives customer order slips')}</span>
+                        <span className="text-[11px] text-slate-500">{tr('متزامن على الموبايل والكمبيوتر', 'Synced on Mobile & PC')}</span>
                       </div>
                     </div>
 
@@ -2715,26 +2835,40 @@ Please confirm my order and unlock my PSN account credentials!`;
                       >
                         <div className="border-b border-white/10 pb-4">
                           <span className="text-[10px] font-bold uppercase tracking-wider text-emerald-400">
-                            {tr('إعدادات قنوات التأكيد', 'Confirmation Channel Settings')}
+                            {tr('إعدادات قنوات التأكيد (تزامن فوري للموبايل والكمبيوتر)', 'Confirmation Channel Settings (Live Mobile & PC Sync)')}
                           </span>
                           <h3 className="text-xl font-black text-white mt-0.5">
-                            {tr('إعدادات رقم الواتساب ورابط صفحة فيسبوك', 'WhatsApp Number & Facebook Page URL')}
+                            {tr('إعدادات رقم الواتساب ورابط ماسنجر فيسبوك', 'WhatsApp Number & Facebook Messenger URL')}
                           </h3>
                           <p className="text-xs text-slate-400 mt-1">
-                            {tr('الرقم الافتراضي المضبوط حالياً هو 01205047037.', 'Default configured WhatsApp number is 01205047037.')}
+                            {tr('الرابط الافتراضي المضبوط حالياً هو https://m.me/358605444011590.', 'Default configured Messenger URL is https://m.me/358605444011590.')}
                           </p>
                         </div>
 
                         <div>
+                          <label className="block text-xs font-bold uppercase text-emerald-400 mb-1.5">
+                            {tr('رقم واتساب الإدارة لتأكيد الطلبات', 'Admin WhatsApp Number')}
+                          </label>
+                          <input
+                            type="text"
+                            dir="ltr"
+                            value={storeConfig.whatsappNumber}
+                            onChange={(e) => setStoreConfig({ ...storeConfig, whatsappNumber: e.target.value })}
+                            placeholder="201205047037"
+                            className="w-full px-4 py-2.5 rounded-xl bg-slate-950 border border-emerald-500/40 text-sm text-white font-mono"
+                          />
+                        </div>
+
+                        <div>
                           <label className="block text-xs font-bold uppercase text-slate-400 mb-1.5">
-                            {tr('رابط صفحة فيسبوك / ماسنجر لتأكيد الطلبات', 'Facebook Page / Messenger Confirmation URL')}
+                            {tr('رابط ماسنجر فيسبوك لتأكيد الطلبات', 'Facebook Messenger Confirmation URL')}
                           </label>
                           <input
                             type="url"
                             dir="ltr"
                             value={storeConfig.storePageUrl}
-                            onChange={(e) => setStoreConfig({ ...storeConfig, storePageUrl: e.target.value })}
-                            placeholder="https://www.facebook.com/profile.php?id=61563495661407"
+                            onChange={(e) => setStoreConfig({ ...storeConfig, storePageUrl: e.target.value, messengerUrl: e.target.value })}
+                            placeholder="https://m.me/358605444011590"
                             className="w-full px-4 py-2.5 rounded-xl bg-slate-950 border border-blue-500/40 text-sm text-white font-mono"
                           />
                         </div>
@@ -2764,7 +2898,7 @@ Please confirm my order and unlock my PSN account credentials!`;
                           type="submit"
                           className="px-6 py-3 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-slate-950 font-black text-xs shadow-lg shadow-emerald-600/25"
                         >
-                          {tr('حفظ الإعدادات والكود السري للإدارة', 'Save Settings & Secret Admin Code')}
+                          {tr('حفظ الإعدادات وتطبيقها على الموبايل والكمبيوتر', 'Save Settings & Sync Mobile/PC')}
                         </button>
                       </form>
                     )}
@@ -2962,10 +3096,10 @@ Please confirm my order and unlock my PSN account credentials!`;
                         <div className="flex flex-wrap items-center justify-between gap-3 bg-slate-900/80 p-4 rounded-2xl border border-white/10">
                           <div>
                             <h3 className="font-bold text-white text-sm">
-                              {tr('قائمة ألعاب المتجر (إضافة، تعديل أو حذف الألعاب)', 'Store Games Catalog (Add, Edit, or Remove Games)')}
+                              {tr('قائمة ألعاب المتجر (أي تعديل يظهر فوراً في الموبايل والكمبيوتر)', 'Store Games Catalog (All edits sync immediately to Mobile & PC)')}
                             </h3>
                             <p className="text-xs text-slate-400">
-                              {tr('يمكنك حذف أي لعبة نهائياً من المتجر بالضغط على زر "حذف اللعبة" باللون الأحمر.', 'Click the red "Remove Game" button next to any title to permanently delete it from the store.')}
+                              {tr('يمكنك تعديل الأسعار أو المخزون أو حذف أي لعبة نهائياً وستنعكس التغييرات في جميع الشاشات.', 'Edit prices, stock, or remove games and changes apply across all views immediately.')}
                             </p>
                           </div>
                           <div className="flex items-center gap-2">
@@ -3241,7 +3375,7 @@ Please confirm my order and unlock my PSN account credentials!`;
                             type="submit"
                             className="px-6 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold shadow-lg shadow-indigo-600/30"
                           >
-                            {editingGameId ? tr('حفظ التعديلات', 'Save Changes') : tr('نشر اللعبة في المتجر', 'Publish Game')}
+                            {editingGameId ? tr('حفظ التعديلات (موبايل وكمبيوتر)', 'Save Changes (Mobile & PC)') : tr('نشر اللعبة في المتجر', 'Publish Game')}
                           </button>
                         </div>
                       </form>
@@ -3350,7 +3484,7 @@ Please confirm my order and unlock my PSN account credentials!`;
 
                     <p className="text-xs text-slate-300 leading-relaxed">
                       {tr(
-                        `هل أنت متأكد من حذف لعبة "${gameToDeleteModal.title}" نهائياً من متجر Bonka Store؟ يمكنك دائماً إضافة ألعاب جديدة من لوحة الإدارة.`,
+                        `هل أنت متأكد من حذف لعبة "${gameToDeleteModal.title}" نهائياً من متجر Bonka Store؟ سيتم حذفها فوراً من شاشات الموبايل والكمبيوتر.`,
                         `Are you sure you want to permanently remove "${gameToDeleteModal.title}" from Bonka Store?`
                       )}
                     </p>
@@ -3406,7 +3540,7 @@ Please confirm my order and unlock my PSN account credentials!`;
                       </p>
                       <p className="leading-relaxed">
                         {tr(
-                          `اضغط على زر واتساب (01205047037) أو ماسنجر صفحة فيسبوك بالأسفل لإرسال رقم طلبك (${postOrderModal.orderNumber}) للإدارة.`,
+                          `اضغط على زر واتساب (01205047037) أو ماسنجر فيسبوك بالأسفل لإرسال رقم طلبك (${postOrderModal.orderNumber}) للإدارة.`,
                           `Click WhatsApp (01205047037) or Facebook Messenger below to send your order ID (${postOrderModal.orderNumber}) to Admin.`
                         )}
                       </p>
@@ -3436,9 +3570,9 @@ Please confirm my order and unlock my PSN account credentials!`;
                         <div className="flex items-center gap-3">
                           <ExternalLink className="w-5 h-5" />
                           <div className={isAr ? 'text-right' : 'text-left'}>
-                            <span className="block">{tr('تأكيد الطلب عبر ماسنجر صفحة فيسبوك', 'Confirm via Facebook Page Messenger')}</span>
+                            <span className="block">{tr('تأكيد الطلب عبر ماسنجر فيسبوك', 'Confirm via Facebook Messenger')}</span>
                             <span className="text-[11px] font-normal text-blue-100">
-                              {tr(`ينسخ رقم الطلب #${postOrderModal.orderNumber} ويفتح صفحتنا على فيسبوك`, `Copies order #${postOrderModal.orderNumber} and opens our Facebook page`)}
+                              {tr(`ينسخ رقم الطلب #${postOrderModal.orderNumber} ويفتح محادثة ماسنجر مباشرة`, `Copies order #${postOrderModal.orderNumber} and opens Messenger`)}
                             </span>
                           </div>
                         </div>
@@ -3458,7 +3592,7 @@ Please confirm my order and unlock my PSN account credentials!`;
                 </div>
               )}
 
-              {/* Floating Facebook Page & WhatsApp Quick Buttons */}
+              {/* Floating Facebook Messenger & WhatsApp Quick Buttons */}
               <div className={`${previewDevice === 'mobile' ? 'sticky bottom-3 px-3 z-30 flex items-center justify-between gap-2' : `fixed bottom-6 ${isAr ? 'left-6' : 'right-6'} z-40 flex flex-wrap items-center gap-2`}`}>
                 {previewDevice === 'mobile' && (
                   <button
@@ -3481,7 +3615,7 @@ Please confirm my order and unlock my PSN account credentials!`;
                 )}
 
                 <a
-                  href={storeConfig.storePageUrl || DEFAULT_FB_PROFILE_URL}
+                  href={activeMessengerHref}
                   target="_blank"
                   rel="noopener noreferrer"
                   className={`flex items-center gap-1.5 ${previewDevice === 'mobile' ? 'p-3' : 'px-3.5 py-3'} rounded-2xl bg-blue-600 hover:bg-blue-500 text-white font-bold text-xs shadow-2xl shadow-blue-600/40 border border-white/15 shrink-0`}
@@ -3605,70 +3739,83 @@ Please confirm my order and unlock my PSN account credentials!`;
                           )}
                         </div>
                       ) : (
-                        cart.map((item) => (
-                          <div
-                            key={item.id}
-                            className={`${previewDevice === 'mobile' ? 'p-3' : 'p-4'} rounded-2xl bg-slate-950 border border-white/10 flex gap-3 items-center shadow-md`}
-                          >
-                            <img
-                              src={item.image}
-                              alt={item.title}
-                              className={`${previewDevice === 'mobile' ? 'w-14 h-14' : 'w-16 h-16'} rounded-xl object-cover shrink-0 border border-white/10`}
-                            />
-                            <div className="flex-1 min-w-0">
-                              <div className="flex items-start justify-between gap-1">
-                                <h4 className="font-bold text-white text-xs sm:text-sm truncate">{item.title}</h4>
-                                <button
-                                  onClick={() => removeFromCart(item.id)}
-                                  className="text-slate-500 hover:text-rose-400 p-0.5 shrink-0"
-                                  title={tr('حذف من السلة', 'Remove item')}
-                                >
-                                  <Trash2 className="w-3.5 h-3.5" />
-                                </button>
-                              </div>
+                        cart.map((item) => {
+                          const liveGame = games.find((g) => g.id === item.gameId);
+                          const displayTitle = liveGame ? liveGame.title : item.title;
+                          const displayImage = liveGame ? liveGame.image : item.image;
+                          const displayConsole = liveGame ? liveGame.console : item.console;
+                          const unitPrice = liveGame
+                            ? (item.licenseType === 'Primary' ? normalizeEgpPrice(liveGame.primaryPrice, 1100) : normalizeEgpPrice(liveGame.secondaryPrice, 650))
+                            : normalizeEgpPrice(item.price, 750);
+                          const unitRetail = liveGame
+                            ? normalizeEgpPrice(liveGame.retailPrice, 3200)
+                            : normalizeEgpPrice(item.retailPrice, 3200);
 
-                              <div className="flex flex-wrap items-center gap-1.5 mt-1">
-                                <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${
-                                  item.licenseType === 'Primary'
-                                    ? 'bg-blue-500/20 text-blue-300 border border-blue-500/30'
-                                    : 'bg-purple-500/20 text-purple-300 border border-purple-500/30'
-                                }`}>
-                                  {item.licenseType === 'Primary' ? tr('حساب أساسي Primary', 'Primary') : tr('حساب ثانوي Secondary', 'Secondary')}
-                                </span>
-                                <span className="text-[10px] px-1.5 py-0.5 rounded bg-white/5 text-slate-300 font-semibold">
-                                  {item.console}
-                                </span>
-                              </div>
+                          return (
+                            <div
+                              key={item.id}
+                              className={`${previewDevice === 'mobile' ? 'p-3' : 'p-4'} rounded-2xl bg-slate-950 border border-white/10 flex gap-3 items-center shadow-md`}
+                            >
+                              <img
+                                src={displayImage}
+                                alt={displayTitle}
+                                className={`${previewDevice === 'mobile' ? 'w-14 h-14' : 'w-16 h-16'} rounded-xl object-cover shrink-0 border border-white/10`}
+                              />
+                              <div className="flex-1 min-w-0">
+                                <div className="flex items-start justify-between gap-1">
+                                  <h4 className="font-bold text-white text-xs sm:text-sm truncate">{displayTitle}</h4>
+                                  <button
+                                    onClick={() => removeFromCart(item.id)}
+                                    className="text-slate-500 hover:text-rose-400 p-0.5 shrink-0"
+                                    title={tr('حذف من السلة', 'Remove item')}
+                                  >
+                                    <Trash2 className="w-3.5 h-3.5" />
+                                  </button>
+                                </div>
 
-                              <div className="flex items-center justify-between mt-2.5 pt-2 border-t border-white/5">
-                                <div>
-                                  <span className="text-[10px] text-slate-500 line-through block">
-                                    {formatEGP(normalizeEgpPrice(item.retailPrice, 3200) * item.quantity, lang)}
+                                <div className="flex flex-wrap items-center gap-1.5 mt-1">
+                                  <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${
+                                    item.licenseType === 'Primary'
+                                      ? 'bg-blue-500/20 text-blue-300 border border-blue-500/30'
+                                      : 'bg-purple-500/20 text-purple-300 border border-purple-500/30'
+                                  }`}>
+                                    {item.licenseType === 'Primary' ? tr('حساب أساسي Primary', 'Primary') : tr('حساب ثانوي Secondary', 'Secondary')}
                                   </span>
-                                  <span className="font-black text-emerald-400 text-sm">
-                                    {formatEGP(normalizeEgpPrice(item.price, 750) * item.quantity, lang)}
+                                  <span className="text-[10px] px-1.5 py-0.5 rounded bg-white/5 text-slate-300 font-semibold">
+                                    {displayConsole}
                                   </span>
                                 </div>
 
-                                <div className="flex items-center gap-1.5 bg-slate-900 rounded-xl p-1 border border-white/15">
-                                  <button
-                                    onClick={() => updateCartQuantity(item, -1)}
-                                    className="w-6 h-6 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs font-black text-white flex items-center justify-center"
-                                  >
-                                    -
-                                  </button>
-                                  <span className="text-xs font-extrabold text-white px-1.5">{item.quantity}</span>
-                                  <button
-                                    onClick={() => updateCartQuantity(item, 1)}
-                                    className="w-6 h-6 rounded-lg bg-blue-600 hover:bg-blue-500 text-xs font-black text-white flex items-center justify-center"
-                                  >
-                                    +
-                                  </button>
+                                <div className="flex items-center justify-between mt-2.5 pt-2 border-t border-white/5">
+                                  <div>
+                                    <span className="text-[10px] text-slate-500 line-through block">
+                                      {formatEGP(unitRetail * item.quantity, lang)}
+                                    </span>
+                                    <span className="font-black text-emerald-400 text-sm">
+                                      {formatEGP(unitPrice * item.quantity, lang)}
+                                    </span>
+                                  </div>
+
+                                  <div className="flex items-center gap-1.5 bg-slate-900 rounded-xl p-1 border border-white/15">
+                                    <button
+                                      onClick={() => updateCartQuantity(item, -1)}
+                                      className="w-6 h-6 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs font-black text-white flex items-center justify-center"
+                                    >
+                                      -
+                                    </button>
+                                    <span className="text-xs font-extrabold text-white px-1.5">{item.quantity}</span>
+                                    <button
+                                      onClick={() => updateCartQuantity(item, 1)}
+                                      className="w-6 h-6 rounded-lg bg-blue-600 hover:bg-blue-500 text-xs font-black text-white flex items-center justify-center"
+                                    >
+                                      +
+                                    </button>
+                                  </div>
                                 </div>
                               </div>
                             </div>
-                          </div>
-                        ))
+                          );
+                        })
                       )}
                     </div>
 
@@ -4252,13 +4399,13 @@ Please confirm my order and unlock my PSN account credentials!`;
                           <span dir="ltr">WhatsApp: 01205047037</span>
                         </a>
                         <a
-                          href={storeConfig.storePageUrl || DEFAULT_FB_PROFILE_URL}
+                          href={activeMessengerHref}
                           target="_blank"
                           rel="noopener noreferrer"
                           className="flex items-center gap-2 text-blue-400 hover:text-blue-300 font-bold"
                         >
                           <ExternalLink className="w-3.5 h-3.5" />
-                          <span>{tr('صفحة فيسبوك وماسنجر الرسمية', 'Official Facebook Page & Messenger')}</span>
+                          <span>{tr('تواصل معنا عبر فيسبوك ماسنجر', 'Chat on Facebook Messenger')}</span>
                         </a>
                       </div>
                     </div>
